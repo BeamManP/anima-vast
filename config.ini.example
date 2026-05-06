@@ -1,0 +1,33 @@
+[vastai]
+api_key = YOUR_API_KEY_HERE
+
+[gpu]
+gpu_name = RTX_4090
+min_gpu_ram = 23
+num_gpus = 1
+
+[instance]
+disk_size = 40
+min_inet_down = 100
+min_reliability = 0.9
+max_price = 0
+instance_type = ondemand
+secure_cloud = true
+
+[docker]
+image = pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+
+[ports]
+comfyui_port = 8188
+anima_port = 8501
+
+[github]
+anima_repo = https://github.com/BeamManP/anima-webui.git
+branch = stable
+gh_token =
+
+[models]
+civitai_api_key =
+
+[anima]
+passphrase =

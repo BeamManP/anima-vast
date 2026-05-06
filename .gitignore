@@ -1,0 +1,18 @@
+# Secrets
+config.ini
+.env
+
+# State
+.instance_state.json
+
+# Temp
+*.tar.gz
+__pycache__/
+*.pyc
+
+# Node (submodule内)
+node_modules/
+
+# OS
+Thumbs.db
+.DS_Store

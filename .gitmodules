@@ -1,0 +1,4 @@
+[submodule "anima-webui"]
+	path = anima-webui
+	url = https://github.com/BeamManP/anima-webui.git
+	branch = stable
