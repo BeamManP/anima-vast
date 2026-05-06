@@ -92,6 +92,10 @@ def api(method, endpoint, api_key, data=None):
         raise
 
 
+BAD_MACHINES = {11652}
+BAD_DATACENTERS = set()
+
+
 def search_offers(api_key, cfg):
     query = {
         "gpu_name": {"eq": cfg.get("gpu", "gpu_name", fallback="RTX_4090")},
@@ -100,6 +104,7 @@ def search_offers(api_key, cfg):
         "disk_space": {"gte": cfg.getfloat("instance", "disk_size", fallback=40)},
         "inet_down": {"gte": cfg.getfloat("instance", "min_inet_down", fallback=100)},
         "reliability": {"gte": cfg.getfloat("instance", "min_reliability", fallback=0.9)},
+        "cuda_max_good": {"gte": 12.4},
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "type": cfg.get("instance", "instance_type", fallback="ondemand"),
@@ -112,7 +117,14 @@ def search_offers(api_key, cfg):
         query["dph_total"] = {"lte": max_price}
 
     result = api("GET", f"/bundles?q={urllib.parse.quote(json.dumps(query))}", api_key)
-    return result.get("offers", [])
+    offers = result.get("offers", [])
+
+    filtered = [o for o in offers
+                if o.get("machine_id") not in BAD_MACHINES
+                and o.get("datacenter") not in BAD_DATACENTERS]
+    if len(filtered) < len(offers):
+        print(f"[INFO] ブラックリストで {len(offers) - len(filtered)} 件除外")
+    return filtered
 
 
 def get_instance(api_key, instance_id):
