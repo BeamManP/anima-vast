@@ -173,6 +173,59 @@ def clear_state():
 
 # ──── SSH ヘルパー ────
 
+def get_ssh_public_key(cfg):
+    inline = cfg.get("ssh", "public_key", fallback="").strip()
+    if inline:
+        return inline
+    pub_path = os.path.expanduser(
+        cfg.get("ssh", "public_key_path", fallback="~/.ssh/id_ed25519.pub"))
+    if os.path.exists(pub_path):
+        with open(pub_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    print(f"[WARN] SSH 公開鍵が見つかりません: {pub_path}")
+    return ""
+
+
+def get_ssh_private_key_path(cfg):
+    key_path = os.path.expanduser(
+        cfg.get("ssh", "private_key_path", fallback="~/.ssh/id_ed25519"))
+    return key_path if os.path.exists(key_path) else ""
+
+
+def attach_ssh_key(api_key, instance_id, ssh_key, retries=6, delay=5):
+    if not ssh_key:
+        print("[WARN] SSH 鍵アタッチをスキップ。")
+        return False
+    for attempt in range(1, retries + 1):
+        try:
+            result = api("POST", f"/instances/{instance_id}/ssh/", api_key,
+                         {"ssh_key": ssh_key})
+            if result.get("success"):
+                print("[OK]   SSH 鍵アタッチ完了。")
+                return True
+            print(f"[WARN] SSH 鍵アタッチ失敗: {result}")
+        except Exception as e:
+            print(f"[WARN] SSH 鍵アタッチ リトライ {attempt}/{retries}: {e}")
+        time.sleep(delay)
+    print("[WARN] SSH 鍵アタッチ未完了。")
+    return False
+
+
+def ssh_base_args(cfg, ssh_port, ssh_host):
+    args = [
+        "ssh", "-p", str(ssh_port),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "LogLevel=ERROR",
+    ]
+    private_key = get_ssh_private_key_path(cfg)
+    if private_key:
+        args.extend(["-i", private_key])
+    args.append(f"root@{ssh_host}")
+    return args
+
+
 def get_ssh_info(api_key, cfg):
     """state から SSH 接続情報を取得。返り値: (instance, ssh_host, ssh_port) or None"""
     state = load_state()
@@ -200,17 +253,10 @@ def get_ssh_info(api_key, cfg):
     return inst, ssh_host, ssh_port
 
 
-def ssh_run(ssh_host, ssh_port, command):
+def ssh_run(cfg, ssh_host, ssh_port, command):
     """SSH 経由でコマンドを実行し、結果を返す"""
-    result = subprocess.run(
-        ["ssh", "-p", str(ssh_port),
-         "-o", "StrictHostKeyChecking=no",
-         "-o", "UserKnownHostsFile=/dev/null",
-         "-o", "LogLevel=ERROR",
-         f"root@{ssh_host}", command],
-        capture_output=True, text=True, timeout=30
-    )
-    return result
+    args = ssh_base_args(cfg, ssh_port, ssh_host) + [command]
+    return subprocess.run(args, capture_output=True, text=True, timeout=30)
 
 
 # ──── URL 構築 ────
@@ -321,6 +367,10 @@ def cmd_deploy(cfg, api_key):
     save_state(instance_id, offer_id)
     print(f"[OK]   ID: {instance_id}")
 
+    ssh_pub = get_ssh_public_key(cfg)
+    if ssh_pub:
+        attach_ssh_key(api_key, instance_id, ssh_pub)
+
     print(f"\n[3/4] 起動待ち...")
     instance = wait_for_running(api_key, instance_id)
     if not instance:
@@ -372,7 +422,7 @@ def cmd_status(cfg, api_key):
         if ssh_host and ssh_port:
             # setup_status を取得
             try:
-                r = ssh_run(ssh_host, ssh_port,
+                r = ssh_run(cfg, ssh_host, ssh_port,
                             "cat /workspace/setup_status.txt 2>/dev/null || echo 'unknown'")
                 setup_status = r.stdout.strip() if r.returncode == 0 else "unknown"
             except Exception:
@@ -383,7 +433,7 @@ def cmd_status(cfg, api_key):
 
             # Cloudflare URL を取得
             try:
-                r = ssh_run(ssh_host, ssh_port,
+                r = ssh_run(cfg, ssh_host, ssh_port,
                             "grep -oP 'https://[a-z0-9-]+\\.trycloudflare\\.com' "
                             "/workspace/cloudflared.log 2>/dev/null | tail -1")
                 cf_url = r.stdout.strip() if r.returncode == 0 else ""
@@ -432,11 +482,12 @@ def cmd_ssh(cfg, api_key):
     if not info:
         return
     inst, ssh_host, ssh_port = info
-    cmd = f"ssh -p {ssh_port} -o StrictHostKeyChecking=no root@{ssh_host}"
-    print(f"[INFO] SSH 接続コマンド:\n  {cmd}\n")
+    args = ssh_base_args(cfg, ssh_port, ssh_host)
+    cmd_str = " ".join(args)
+    print(f"[INFO] SSH 接続コマンド:\n  {cmd_str}\n")
     print("接続しますか？ (Y/n): ", end="")
     if input().strip().lower() != "n":
-        os.system(cmd)
+        subprocess.run(args)
 
 
 def cmd_exec(cfg, api_key):
@@ -452,7 +503,7 @@ def cmd_exec(cfg, api_key):
 
     print(f"[EXEC] {remote_cmd}")
     try:
-        r = ssh_run(ssh_host, ssh_port, remote_cmd)
+        r = ssh_run(cfg, ssh_host, ssh_port, remote_cmd)
         if r.stdout:
             print(r.stdout, end="")
         if r.stderr:
@@ -493,7 +544,7 @@ def cmd_logs(cfg, api_key):
 
     print(f"[LOGS] {log_name} (tail {tail_n})\n")
     try:
-        r = ssh_run(ssh_host, ssh_port, f"tail -n {tail_n} {log_path} 2>/dev/null || echo '(ファイル未作成)'")
+        r = ssh_run(cfg, ssh_host, ssh_port, f"tail -n {tail_n} {log_path} 2>/dev/null || echo '(ファイル未作成)'")
         print(r.stdout if r.stdout else "(空)")
     except subprocess.TimeoutExpired:
         print("[ERROR] タイムアウト")
@@ -529,19 +580,24 @@ def cmd_upload(cfg, api_key):
     print(f"[OK]   {size_mb:.1f} MB")
 
     print("[2/3] SCP 転送中...")
-    ret = subprocess.run([
+    scp_args = [
         "scp", "-P", str(ssh_port),
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
-        tar_file, f"root@{ssh_host}:/workspace/anima-upload.tar.gz"
-    ]).returncode
+        "-o", "IdentitiesOnly=yes",
+    ]
+    private_key = get_ssh_private_key_path(cfg)
+    if private_key:
+        scp_args.extend(["-i", private_key])
+    scp_args.extend([tar_file, f"root@{ssh_host}:/workspace/anima-upload.tar.gz"])
+    ret = subprocess.run(scp_args).returncode
     if ret != 0:
         print("[ERROR] SCP 失敗")
         os.remove(tar_file)
         return
 
     print("[3/3] リモート展開 + 再起動中...")
-    r = ssh_run(ssh_host, ssh_port,
+    r = ssh_run(cfg, ssh_host, ssh_port,
                 "cd /workspace && tar -xzf anima-upload.tar.gz && rm anima-upload.tar.gz "
                 "&& cd anima-webui && npm install --production 2>/dev/null "
                 "&& pkill -f 'node server/index.js' 2>/dev/null; "
