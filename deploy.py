@@ -268,7 +268,8 @@ def get_ssh_info(api_key, cfg):
 def ssh_run(cfg, ssh_host, ssh_port, command):
     """SSH 経由でコマンドを実行し、結果を返す"""
     args = ssh_base_args(cfg, ssh_port, ssh_host) + [command]
-    return subprocess.run(args, capture_output=True, text=True, timeout=30)
+    return subprocess.run(args, capture_output=True, timeout=30,
+                          encoding="utf-8", errors="replace")
 
 
 # ──── URL 構築 ────

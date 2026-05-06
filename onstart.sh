@@ -154,6 +154,15 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
+# ブローカーにトンネルURLを自動登録
+BROKER="https://anima-broker.beamman.workers.dev/register"
+if [ -n "$CF_URL" ]; then
+    curl -s -X POST "$BROKER" -H "Content-Type: application/json" \
+         -d "{\"url\":\"${CF_URL}\"}" >/dev/null 2>&1 \
+        && echo "[OK] Broker registered: ${CF_URL}" \
+        || echo "[WARN] Broker registration failed"
+fi
+
 echo "done" > "$STATUS"
 echo ""
 echo "============================================"
