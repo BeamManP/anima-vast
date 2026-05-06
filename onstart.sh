@@ -87,11 +87,12 @@ echo "[OK] HF models ready"
 phase "Phase 4b: Models (CivitAI)"
 if [ -n "${CIVITAI_API_KEY}" ]; then
     D=$M/diffusion_models; K=$CIVITAI_API_KEY; U=https://civitai.com/api/download/models
-    dl() { [ ! -f "$D/$1" ] && aria2c -x16 -s16 -d $D -o "$1" "$U/$2&token=$K" || true; }
+    dl() { [ ! -f "$D/$1" ] && wget -q -O "$D/$1" "$U/$2&token=$K" || true; }
     dl copycatAnima_20260209.safetensors '2673536?type=Model&format=SafeTensor&size=full&fp=fp16'
     dl copycatAnima_0302.safetensors '2737875?type=Model&format=SafeTensor&size=full&fp=fp16'
     dl cottonanima_preview.safetensors '2678837?type=Model&format=SafeTensor&size=full&fp=fp16'
     dl animaCatTower_v02_pruned_bf16.safetensors '2688353?type=Model&format=SafeTensor&size=pruned&fp=bf16'
+    dl waiANIMA_v10.safetensors '2859702?type=Model&format=SafeTensor&size=pruned&fp=fp16'
     echo "[OK] CivitAI models ready"
 else
     echo "[SKIP] CIVITAI_API_KEY unset"
