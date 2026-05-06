@@ -23,6 +23,7 @@ anima_port = 8501
 
 [github]
 anima_repo = https://github.com/BeamManP/anima-webui.git
+setup_repo = https://github.com/BeamManP/anima-vast.git
 branch = stable
 gh_token =
 

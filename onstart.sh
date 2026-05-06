@@ -1,14 +1,19 @@
 #!/bin/bash
 # ComfyUI + AnimaWebUI セットアップ (Vast.ai onstart)
-# ANIMA_REPO_PATH は deploy.py が heredoc 先頭に埋め込む
+# ANIMA_REPO_PATH, SETUP_REPO 等は環境変数で注入
 set -e
 
 W=/workspace; C=$W/ComfyUI; A=$W/anima-webui
+STATUS=$W/setup_status.txt
 exec > >(tee -a "$W/setup.log") 2>&1
+
+phase() { echo "$1" > "$STATUS"; echo "=== $1 ==="; }
+
 echo "[$(date)] セットアップ開始"
+echo "starting" > "$STATUS"
 
 # ── Phase 1: システム ──
-echo "=== Phase 1: System ==="
+phase "Phase 1: System"
 apt-get update -qq
 apt-get install -y -qq git curl wget aria2 ca-certificates gnupg >/dev/null 2>&1
 
@@ -23,7 +28,7 @@ pip install -q --upgrade pip
 echo "[OK] System ready"
 
 # ── Phase 2: ComfyUI ──
-echo "=== Phase 2: ComfyUI ==="
+phase "Phase 2: ComfyUI"
 if [ ! -d "$C" ]; then
     cd $W && git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git
     cd $C
@@ -35,7 +40,7 @@ else
 fi
 
 # ── Phase 3: カスタムノード ──
-echo "=== Phase 3: Custom Nodes ==="
+phase "Phase 3: Custom Nodes"
 N=$C/custom_nodes; mkdir -p $N
 install_node() {
     [ -d "$N/$2" ] && return 0
@@ -47,7 +52,7 @@ install_node "https://github.com/ltdrdata/ComfyUI-Manager.git" "ComfyUI-Manager"
 echo "[OK] Custom nodes ready"
 
 # ── Phase 4: モデル (HuggingFace) ──
-echo "=== Phase 4: Models (HF) ==="
+phase "Phase 4: Models (HF)"
 pip install -q huggingface_hub
 M=$C/models
 mkdir -p $M/diffusion_models $M/text_encoders $M/vae $M/upscale_models
@@ -79,7 +84,7 @@ PY
 echo "[OK] HF models ready"
 
 # ── Phase 4b: モデル (CivitAI) ──
-echo "=== Phase 4b: Models (CivitAI) ==="
+phase "Phase 4b: Models (CivitAI)"
 if [ -n "${CIVITAI_API_KEY}" ]; then
     D=$M/diffusion_models; K=$CIVITAI_API_KEY; U=https://civitai.com/api/download/models
     dl() { [ ! -f "$D/$1" ] && aria2c -x16 -s16 -d $D -o "$1" "$U/$2&token=$K" || true; }
@@ -93,7 +98,7 @@ else
 fi
 
 # ── Phase 5: AnimaWebUI ──
-echo "=== Phase 5: AnimaWebUI ==="
+phase "Phase 5: AnimaWebUI"
 if [ ! -d "$A" ]; then
     REPO_URL="https://github.com/${ANIMA_REPO_PATH}.git"
     [ -n "${GH_TOKEN:-}" ] && REPO_URL="https://${GH_TOKEN}@github.com/${ANIMA_REPO_PATH}.git"
@@ -118,7 +123,7 @@ EOF
 fi
 
 # ── Phase 6: サービス起動 ──
-echo "=== Phase 6: Start Services ==="
+phase "Phase 6: Start Services"
 cd $C
 nohup python main.py --listen 0.0.0.0 --port 8188 --disable-auto-launch > $W/comfyui.log 2>&1 &
 echo "[OK] ComfyUI starting (PID: $!)"
@@ -135,7 +140,7 @@ if [ -d "$A" ] && [ -f "$A/server/index.js" ]; then
 fi
 
 # ── Phase 7: Cloudflare Tunnel ──
-echo "=== Phase 7: Tunnel ==="
+phase "Phase 7: Tunnel"
 command -v cloudflared &>/dev/null || {
     wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
     chmod +x /usr/local/bin/cloudflared
@@ -149,6 +154,7 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
+echo "done" > "$STATUS"
 echo ""
 echo "============================================"
 echo "  セットアップ完了！"

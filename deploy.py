@@ -4,6 +4,7 @@ anima-vast deploy — Vast.ai に ComfyUI + AnimaWebUI をデプロイ
 import configparser
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -13,10 +14,10 @@ import urllib.parse
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.ini")
 STATE_FILE = os.path.join(SCRIPT_DIR, ".instance_state.json")
-ONSTART_SH = os.path.join(SCRIPT_DIR, "onstart.sh")
 ANIMA_SRC_DIR = os.path.join(SCRIPT_DIR, "anima-webui")
 
 API_BASE = "https://console.vast.ai/api/v0"
+SETUP_REPO_DEFAULT = "https://github.com/BeamManP/anima-vast.git"
 
 
 # ──── 設定 ────
@@ -44,15 +45,25 @@ def get_api_key(cfg):
 def get_env_vars(cfg):
     """インスタンスに渡す環境変数を組み立てる"""
     env = {}
-    for key, ini_section, ini_key, env_name in [
-        ("passphrase", "anima", "passphrase", "ANIMA_PASSPHRASE"),
-        ("civitai", "models", "civitai_api_key", "CIVITAI_API_KEY"),
-        ("gh_token", "github", "gh_token", "GH_TOKEN"),
-        ("branch", "github", "branch", "DEPLOY_BRANCH"),
+    for ini_section, ini_key, env_name in [
+        ("anima", "passphrase", "ANIMA_PASSPHRASE"),
+        ("models", "civitai_api_key", "CIVITAI_API_KEY"),
+        ("github", "gh_token", "GH_TOKEN"),
+        ("github", "branch", "DEPLOY_BRANCH"),
     ]:
         val = cfg.get(ini_section, ini_key, fallback="").strip()
         if val:
             env[env_name] = val
+
+    # anima-webui のリポパス
+    repo = cfg.get("github", "anima_repo",
+                    fallback="https://github.com/BeamManP/anima-webui.git")
+    repo_path = repo.split("github.com/")[-1].replace(".git", "")
+    env["ANIMA_REPO_PATH"] = repo_path
+
+    # セットアップリポ URL
+    env["SETUP_REPO"] = cfg.get("github", "setup_repo", fallback=SETUP_REPO_DEFAULT)
+
     return env
 
 
@@ -118,31 +129,27 @@ def get_instances(api_key):
     return api("GET", "/instances/", api_key).get("instances", [])
 
 
-# ──── onstart コマンド構築 ────
+# ──── onstart: bootstrap 方式 ────
 
 def build_onstart_cmd(cfg):
-    """onstart.sh を読み込み、cat heredoc でラップして返す"""
-    if not os.path.exists(ONSTART_SH):
-        print(f"[ERROR] {ONSTART_SH} が見つかりません。")
-        sys.exit(1)
+    """短い bootstrap スクリプトを生成。本体は git clone で取得する。"""
+    setup_repo = cfg.get("github", "setup_repo", fallback=SETUP_REPO_DEFAULT)
 
-    with open(ONSTART_SH, "r", encoding="utf-8") as f:
-        script = f.read()
+    bootstrap = (
+        "#!/bin/bash\n"
+        "set -e\n"
+        "apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1\n"
+        f'git clone --depth 1 "{setup_repo}" /workspace/anima-vast 2>/dev/null '
+        "|| (cd /workspace/anima-vast && git pull --ff-only)\n"
+        "bash /workspace/anima-vast/onstart.sh\n"
+    )
 
-    # config.ini の値をスクリプト先頭に環境変数として埋め込む
-    repo = cfg.get("github", "anima_repo",
-                    fallback="https://github.com/BeamManP/anima-webui.git")
-    repo_path = repo.split("github.com/")[-1].replace(".git", "")
-    header = f'ANIMA_REPO_PATH="{repo_path}"'
-
-    full_script = f"{header}\n{script}"
-    cmd = f"cat<<'S'>/tmp/s.sh\n{full_script}\nS\nbash /tmp/s.sh"
-
-    cmd_len = len(cmd)
+    cmd_len = len(bootstrap)
     print(f"[INFO] onstart コマンド長: {cmd_len} / 4048 文字")
     if cmd_len > 4048:
-        print(f"[WARN] Vast.ai 制限 4048 文字を超過しています ({cmd_len})。")
-    return cmd
+        print(f"[ERROR] 4048 文字超過 ({cmd_len})。デプロイを中断します。")
+        sys.exit(1)
+    return bootstrap
 
 
 # ──── 状態ファイル ────
@@ -162,6 +169,48 @@ def load_state():
 def clear_state():
     if os.path.exists(STATE_FILE):
         os.remove(STATE_FILE)
+
+
+# ──── SSH ヘルパー ────
+
+def get_ssh_info(api_key, cfg):
+    """state から SSH 接続情報を取得。返り値: (instance, ssh_host, ssh_port) or None"""
+    state = load_state()
+    if not state:
+        print("[INFO] アクティブなインスタンスはありません。")
+        return None
+
+    instance_id = state["instance_id"]
+    try:
+        inst = get_instance(api_key, instance_id)
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return None
+
+    if inst.get("actual_status") != "running":
+        print(f"[ERROR] インスタンス未起動 ({inst.get('actual_status')})")
+        return None
+
+    ssh_host = inst.get("ssh_host", "")
+    ssh_port = inst.get("ssh_port", "")
+    if not ssh_host or not ssh_port:
+        print("[ERROR] SSH情報が取得できません。")
+        return None
+
+    return inst, ssh_host, ssh_port
+
+
+def ssh_run(ssh_host, ssh_port, command):
+    """SSH 経由でコマンドを実行し、結果を返す"""
+    result = subprocess.run(
+        ["ssh", "-p", str(ssh_port),
+         "-o", "StrictHostKeyChecking=no",
+         "-o", "UserKnownHostsFile=/dev/null",
+         "-o", "LogLevel=ERROR",
+         f"root@{ssh_host}", command],
+        capture_output=True, text=True, timeout=30
+    )
+    return result
 
 
 # ──── URL 構築 ────
@@ -250,11 +299,10 @@ def cmd_deploy(cfg, api_key):
     onstart_cmd = build_onstart_cmd(cfg)
     env_vars = get_env_vars(cfg)
 
-    port_env = {
-        f"-p {cfg.getint('ports', 'comfyui_port', fallback=8188)}:{cfg.getint('ports', 'comfyui_port', fallback=8188)}": "1",
-        f"-p {cfg.getint('ports', 'anima_port', fallback=8501)}:{cfg.getint('ports', 'anima_port', fallback=8501)}": "1",
-    }
-    env_vars.update(port_env)
+    comfyui_port = cfg.getint("ports", "comfyui_port", fallback=8188)
+    anima_port = cfg.getint("ports", "anima_port", fallback=8501)
+    env_vars[f"-p {comfyui_port}:{comfyui_port}"] = "1"
+    env_vars[f"-p {anima_port}:{anima_port}"] = "1"
 
     result = api("PUT", f"/asks/{offer_id}/", api_key, {
         "client_id": "me",
@@ -280,11 +328,18 @@ def cmd_deploy(cfg, api_key):
 
     print(f"\n[4/4] セットアップ中（数分待ってからアクセス）")
     urls = build_urls(instance, cfg)
+    ssh_host = instance.get("ssh_host", "")
+    ssh_port = instance.get("ssh_port", "")
+
     print(f"\n{'='*40}")
     print(f"  デプロイ完了！ (${price:.4f}/h)")
     print(f"{'='*40}\n")
     print_urls(urls)
-    print(f"\n  Instance ID: {instance_id}\n")
+    if ssh_host and ssh_port:
+        print(f"\n  SSH: ssh -p {ssh_port} root@{ssh_host}")
+    print(f"\n  セットアップ進捗:")
+    print(f"    python deploy.py logs setup")
+    print(f"  Instance ID: {instance_id}\n")
 
 
 def cmd_status(cfg, api_key):
@@ -302,6 +357,9 @@ def cmd_status(cfg, api_key):
 
     status = inst.get("actual_status", inst.get("status_msg", "unknown"))
     price = inst.get("dph_total", 0)
+    ssh_host = inst.get("ssh_host", "")
+    ssh_port = inst.get("ssh_port", "")
+
     print(f"  ID:      {instance_id}")
     print(f"  状態:    {status}")
     print(f"  GPU:     {inst.get('gpu_name', '?')}")
@@ -310,6 +368,30 @@ def cmd_status(cfg, api_key):
     if status == "running":
         print()
         print_urls(build_urls(inst, cfg))
+
+        if ssh_host and ssh_port:
+            # setup_status を取得
+            try:
+                r = ssh_run(ssh_host, ssh_port,
+                            "cat /workspace/setup_status.txt 2>/dev/null || echo 'unknown'")
+                setup_status = r.stdout.strip() if r.returncode == 0 else "unknown"
+            except Exception:
+                setup_status = "unreachable"
+
+            print(f"\n  セットアップ: {setup_status}")
+            print(f"  SSH: ssh -p {ssh_port} root@{ssh_host}")
+
+            # Cloudflare URL を取得
+            try:
+                r = ssh_run(ssh_host, ssh_port,
+                            "grep -oP 'https://[a-z0-9-]+\\.trycloudflare\\.com' "
+                            "/workspace/cloudflared.log 2>/dev/null | tail -1")
+                cf_url = r.stdout.strip() if r.returncode == 0 else ""
+                if cf_url:
+                    print(f"  Cloudflare:  {cf_url}")
+            except Exception:
+                pass
+
     print()
 
 
@@ -345,28 +427,85 @@ def cmd_list(cfg, api_key):
               f"{i.get('actual_status', '?'):<12} ${i.get('dph_total', 0):.4f}")
 
 
-def cmd_upload(cfg, api_key):
-    state = load_state()
-    if not state:
-        print("[INFO] アクティブなインスタンスがありません。先に deploy してください。")
+def cmd_ssh(cfg, api_key):
+    info = get_ssh_info(api_key, cfg)
+    if not info:
+        return
+    inst, ssh_host, ssh_port = info
+    cmd = f"ssh -p {ssh_port} -o StrictHostKeyChecking=no root@{ssh_host}"
+    print(f"[INFO] SSH 接続コマンド:\n  {cmd}\n")
+    print("接続しますか？ (Y/n): ", end="")
+    if input().strip().lower() != "n":
+        os.system(cmd)
+
+
+def cmd_exec(cfg, api_key):
+    if len(sys.argv) < 3:
+        print("使い方: python deploy.py exec \"command\"")
         return
 
-    instance_id = state["instance_id"]
+    remote_cmd = " ".join(sys.argv[2:])
+    info = get_ssh_info(api_key, cfg)
+    if not info:
+        return
+    inst, ssh_host, ssh_port = info
+
+    print(f"[EXEC] {remote_cmd}")
     try:
-        inst = get_instance(api_key, instance_id)
+        r = ssh_run(ssh_host, ssh_port, remote_cmd)
+        if r.stdout:
+            print(r.stdout, end="")
+        if r.stderr:
+            print(r.stderr, end="", file=sys.stderr)
+        sys.exit(r.returncode)
+    except subprocess.TimeoutExpired:
+        print("[ERROR] タイムアウト (30s)")
     except Exception as e:
         print(f"[ERROR] {e}")
+
+
+LOG_FILES = {
+    "setup": "/workspace/setup.log",
+    "comfyui": "/workspace/comfyui.log",
+    "anima": "/workspace/anima.log",
+    "cloudflared": "/workspace/cloudflared.log",
+}
+
+
+def cmd_logs(cfg, api_key):
+    if len(sys.argv) < 3 or sys.argv[2] not in LOG_FILES:
+        print(f"使い方: python deploy.py logs <{' | '.join(LOG_FILES.keys())}> [--tail N]")
         return
 
-    if inst.get("actual_status") != "running":
-        print(f"[ERROR] インスタンス未起動 ({inst.get('actual_status')})")
-        return
+    log_name = sys.argv[2]
+    log_path = LOG_FILES[log_name]
 
-    ssh_host = inst.get("ssh_host", "")
-    ssh_port = inst.get("ssh_port", "")
-    if not ssh_host or not ssh_port:
-        print("[ERROR] SSH情報なし。")
+    tail_n = 50
+    if "--tail" in sys.argv:
+        idx = sys.argv.index("--tail")
+        if idx + 1 < len(sys.argv):
+            tail_n = int(sys.argv[idx + 1])
+
+    info = get_ssh_info(api_key, cfg)
+    if not info:
         return
+    inst, ssh_host, ssh_port = info
+
+    print(f"[LOGS] {log_name} (tail {tail_n})\n")
+    try:
+        r = ssh_run(ssh_host, ssh_port, f"tail -n {tail_n} {log_path} 2>/dev/null || echo '(ファイル未作成)'")
+        print(r.stdout if r.stdout else "(空)")
+    except subprocess.TimeoutExpired:
+        print("[ERROR] タイムアウト")
+    except Exception as e:
+        print(f"[ERROR] {e}")
+
+
+def cmd_upload(cfg, api_key):
+    info = get_ssh_info(api_key, cfg)
+    if not info:
+        return
+    inst, ssh_host, ssh_port = info
 
     if not os.path.isdir(ANIMA_SRC_DIR):
         print(f"[ERROR] anima-webui が見つかりません: {ANIMA_SRC_DIR}")
@@ -378,7 +517,10 @@ def cmd_upload(cfg, api_key):
     exclude_args = " ".join([f'--exclude="{e}"' for e in excludes])
 
     print("[1/3] パッケージ中...")
-    ret = os.system(f'tar -czf "{tar_file}" -C "{SCRIPT_DIR}" {exclude_args} "anima-webui"')
+    ret = subprocess.run(
+        f'tar -czf "{tar_file}" -C "{SCRIPT_DIR}" {exclude_args} "anima-webui"',
+        shell=True
+    ).returncode
     if ret != 0:
         print("[ERROR] tar 失敗")
         return
@@ -387,38 +529,46 @@ def cmd_upload(cfg, api_key):
     print(f"[OK]   {size_mb:.1f} MB")
 
     print("[2/3] SCP 転送中...")
-    ret = os.system(
-        f'scp -P {ssh_port} -o StrictHostKeyChecking=no '
-        f'"{tar_file}" root@{ssh_host}:/workspace/anima-upload.tar.gz'
-    )
+    ret = subprocess.run([
+        "scp", "-P", str(ssh_port),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        tar_file, f"root@{ssh_host}:/workspace/anima-upload.tar.gz"
+    ]).returncode
     if ret != 0:
         print("[ERROR] SCP 失敗")
         os.remove(tar_file)
         return
 
-    print("[3/3] リモート展開中...")
-    ret = os.system(
-        f'ssh -p {ssh_port} -o StrictHostKeyChecking=no root@{ssh_host} '
-        f'"cd /workspace && tar -xzf anima-upload.tar.gz && rm anima-upload.tar.gz '
-        f'&& cd anima-webui && npm install --production 2>/dev/null && echo DONE"'
-    )
+    print("[3/3] リモート展開 + 再起動中...")
+    r = ssh_run(ssh_host, ssh_port,
+                "cd /workspace && tar -xzf anima-upload.tar.gz && rm anima-upload.tar.gz "
+                "&& cd anima-webui && npm install --production 2>/dev/null "
+                "&& pkill -f 'node server/index.js' 2>/dev/null; "
+                "cd /workspace/anima-webui && nohup node server/index.js > /workspace/anima.log 2>&1 & "
+                "echo DONE")
     os.remove(tar_file)
 
-    if ret == 0:
-        print("\n[OK] 転送完了！")
+    if r.returncode == 0:
+        print("\n[OK] 転送+再起動完了！")
         print_urls(build_urls(inst, cfg))
     else:
         print("[ERROR] リモート展開失敗")
+        if r.stderr:
+            print(r.stderr)
 
 
 # ──── エントリーポイント ────
 
 COMMANDS = {
-    "deploy": ("Vast.ai にデプロイ", cmd_deploy),
-    "upload": ("WebUI をインスタンスに転送", cmd_upload),
-    "status": ("インスタンス状態確認", cmd_status),
+    "deploy":  ("Vast.ai にデプロイ", cmd_deploy),
+    "status":  ("インスタンス状態確認", cmd_status),
+    "ssh":     ("SSH 接続", cmd_ssh),
+    "exec":    ("リモートコマンド実行", cmd_exec),
+    "logs":    ("リモートログ表示", cmd_logs),
+    "upload":  ("WebUI をインスタンスに転送", cmd_upload),
     "destroy": ("インスタンス破棄", cmd_destroy),
-    "list": ("全インスタンス一覧", cmd_list),
+    "list":    ("全インスタンス一覧", cmd_list),
 }
 
 
