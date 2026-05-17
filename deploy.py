@@ -104,7 +104,7 @@ def search_offers(api_key, cfg):
         "disk_space": {"gte": cfg.getfloat("instance", "disk_size", fallback=40)},
         "inet_down": {"gte": cfg.getfloat("instance", "min_inet_down", fallback=100)},
         "reliability": {"gte": cfg.getfloat("instance", "min_reliability", fallback=0.9)},
-        "cuda_max_good": {"gte": 12.4},
+        "cuda_max_good": {"gte": 13.0},
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "type": cfg.get("instance", "instance_type", fallback="ondemand"),
@@ -336,10 +336,25 @@ def wait_for_running(api_key, instance_id, timeout=600):
 def cmd_deploy(cfg, api_key):
     state = load_state()
     if state:
-        print(f"[INFO] 既存インスタンスあり: {state['instance_id']}")
-        print("       先に destroy してください。")
-        return
+        instance_id = state["instance_id"]
+        try:
+            inst = get_instance(api_key, instance_id)
+            status = inst.get("actual_status", inst.get("status_msg", ""))
+            if status in ("exited", "error", "destroyed", "offline", ""):
+                print(f"[INFO] 旧インスタンス {instance_id} は終了済み ({status})。状態をクリア。")
+                clear_state()
+            else:
+                print(f"[INFO] 既存インスタンスあり: {instance_id} ({status})")
+                print("       先に destroy してください。")
+                return
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 403):
+                print(f"[INFO] 旧インスタンス {instance_id} は存在しません。状態をクリア。")
+                clear_state()
+            else:
+                raise
 
+    race_count = cfg.getint("instance", "race_count", fallback=4)
     gpu_name = cfg.get("gpu", "gpu_name", fallback="RTX_4090")
     print(f"\n[1/4] {gpu_name} を検索中...")
     offers = search_offers(api_key, cfg)
@@ -347,47 +362,111 @@ def cmd_deploy(cfg, api_key):
         print("[ERROR] 条件に合うGPUが見つかりません。")
         return
 
-    best = offers[0]
-    price = best.get("dph_total", 0)
-    print(f"[OK]   {len(offers)} 件 | 最安: ${price:.4f}/h "
-          f"| {best.get('gpu_name')} ({best.get('gpu_ram', 0):.0f}GB)")
+    race_offers = offers[:race_count]
+    print(f"[OK]   {len(offers)} 件ヒット | レース: {len(race_offers)} 台")
+    for i, o in enumerate(race_offers):
+        print(f"       #{i+1} ${o.get('dph_total', 0):.4f}/h "
+              f"| {o.get('gpu_name')} ({o.get('gpu_ram', 0):.0f}GB) "
+              f"| machine {o.get('machine_id')}")
 
-    offer_id = best["id"]
-    print(f"\n[2/4] インスタンス作成中... (Offer: {offer_id})")
-
+    print(f"\n[2/4] {len(race_offers)} 台同時作成中...")
     onstart_cmd = build_onstart_cmd(cfg)
     env_vars = get_env_vars(cfg)
-
     comfyui_port = cfg.getint("ports", "comfyui_port", fallback=8188)
     anima_port = cfg.getint("ports", "anima_port", fallback=8501)
     env_vars[f"-p {comfyui_port}:{comfyui_port}"] = "1"
     env_vars[f"-p {anima_port}:{anima_port}"] = "1"
 
-    result = api("PUT", f"/asks/{offer_id}/", api_key, {
+    create_payload = {
         "client_id": "me",
         "image": cfg.get("docker", "image", fallback="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"),
         "disk": cfg.getfloat("instance", "disk_size", fallback=40),
         "env": env_vars,
         "onstart": onstart_cmd,
         "runtype": "ssh_direct ssh_proxy",
-    })
+    }
 
-    if not result.get("success"):
-        print(f"[ERROR] 作成失敗: {result}")
+    racers = []
+    for i, offer in enumerate(race_offers):
+        try:
+            result = api("PUT", f"/asks/{offer['id']}/", api_key, create_payload)
+            if result.get("success"):
+                iid = result["new_contract"]
+                racers.append({"id": iid, "offer": offer})
+                print(f"  #{i+1} 作成OK: {iid}")
+            else:
+                print(f"  #{i+1} 作成失敗: {result}")
+        except Exception as e:
+            print(f"  #{i+1} 作成エラー: {e}")
+        if i < len(race_offers) - 1:
+            time.sleep(1.5)
+
+    if not racers:
+        print("[ERROR] 全台作成失敗。")
         return
-
-    instance_id = result.get("new_contract")
-    save_state(instance_id, offer_id)
-    print(f"[OK]   ID: {instance_id}")
 
     ssh_pub = get_ssh_public_key(cfg)
-    if ssh_pub:
-        attach_ssh_key(api_key, instance_id, ssh_pub)
+    for r in racers:
+        if ssh_pub:
+            try:
+                attach_ssh_key(api_key, r["id"], ssh_pub, retries=2, delay=3)
+            except Exception:
+                pass
+        time.sleep(0.5)
 
-    print(f"\n[3/4] 起動待ち...")
-    instance = wait_for_running(api_key, instance_id)
-    if not instance:
+    print(f"\n[3/4] レース開始 ({len(racers)} 台)...")
+    winner = None
+    start = time.time()
+    timeout = 600
+    last_report = {}
+    while time.time() - start < timeout:
+        alive = []
+        for r in racers:
+            try:
+                inst = get_instance(api_key, r["id"])
+                status = inst.get("actual_status", inst.get("status_msg", "unknown"))
+                if status != last_report.get(r["id"]):
+                    print(f"       {r['id']}: {status} ({int(time.time() - start)}s)")
+                    last_report[r["id"]] = status
+                if status == "running":
+                    winner = {"id": r["id"], "instance": inst, "offer": r["offer"]}
+                    break
+                if status not in ("exited", "error", "destroyed"):
+                    alive.append(r)
+            except Exception:
+                alive.append(r)
+        if winner:
+            break
+        if not alive:
+            print("[ERROR] 全台が異常終了。")
+            return
+        racers = alive
+        time.sleep(10)
+
+    if not winner:
+        print(f"[ERROR] タイムアウト ({int(time.time() - start)}s)")
+        for r in racers:
+            try:
+                api("DELETE", f"/instances/{r['id']}/", api_key)
+            except Exception:
+                pass
         return
+
+    losers = [r for r in racers if r["id"] != winner["id"]]
+    if losers:
+        print(f"\n  勝者: {winner['id']} | 敗者 {len(losers)} 台を破棄中...")
+        for r in losers:
+            try:
+                api("DELETE", f"/instances/{r['id']}/", api_key)
+                print(f"       {r['id']} 破棄OK")
+            except Exception as e:
+                print(f"       {r['id']} 破棄失敗: {e}")
+            time.sleep(0.5)
+
+    instance_id = winner["id"]
+    instance = winner["instance"]
+    price = winner["offer"].get("dph_total", 0)
+    save_state(instance_id, winner["offer"].get("id"))
 
     print(f"\n[4/4] セットアップ中（数分待ってからアクセス）")
     urls = build_urls(instance, cfg)

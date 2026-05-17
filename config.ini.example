@@ -13,9 +13,10 @@ min_reliability = 0.9
 max_price = 0
 instance_type = ondemand
 secure_cloud = true
+race_count = 4
 
 [docker]
-image = pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+image = pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel
 
 [ports]
 comfyui_port = 8188

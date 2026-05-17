@@ -33,7 +33,7 @@ if [ ! -d "$C" ]; then
     cd $W && git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git
     cd $C
     pip install -q -r requirements.txt
-    pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+    pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
     echo "[OK] ComfyUI installed"
 else
     echo "[SKIP] ComfyUI exists"
@@ -61,8 +61,7 @@ python <<'PY'
 from huggingface_hub import hf_hub_download as h
 import shutil, os
 R="circlestone-labs/Anima"; M="/workspace/ComfyUI/models"
-for d in ["diffusion_models/anima-preview.safetensors",
-          "text_encoders/qwen_3_06b_base.safetensors",
+for d in ["text_encoders/qwen_3_06b_base.safetensors",
           "vae/qwen_image_vae.safetensors"]:
     t = M + "/" + d
     if not os.path.exists(t):
@@ -70,11 +69,6 @@ for d in ["diffusion_models/anima-preview.safetensors",
         os.makedirs(os.path.dirname(t), exist_ok=True)
         shutil.copy2(p, t)
         print(f"[DL] {os.path.basename(t)}")
-# botan_anima
-bt = M + "/diffusion_models/botan_animaTest_V0_3.safetensors"
-if not os.path.exists(bt):
-    shutil.copy2(h("KKTT8823/botan_anima", "試作品/botan_animaTest_V0_3.safetensors"), bt)
-    print("[DL] botan_animaTest_V0_3")
 # upscaler
 us = M + "/upscale_models/2x-AnimeSharpV4_Fast_RCAN_PU.safetensors"
 if not os.path.exists(us):
@@ -88,10 +82,8 @@ phase "Phase 4b: Models (CivitAI)"
 if [ -n "${CIVITAI_API_KEY}" ]; then
     D=$M/diffusion_models; K=$CIVITAI_API_KEY; U=https://civitai.com/api/download/models
     dl() { [ ! -f "$D/$1" ] && wget -q -O "$D/$1" "$U/$2&token=$K" || true; }
-    dl copycatAnima_20260209.safetensors '2673536?type=Model&format=SafeTensor&size=full&fp=fp16'
-    dl copycatAnima_0302.safetensors '2737875?type=Model&format=SafeTensor&size=full&fp=fp16'
-    dl cottonanima_preview.safetensors '2678837?type=Model&format=SafeTensor&size=full&fp=fp16'
-    dl animaCatTower_v02_pruned_bf16.safetensors '2688353?type=Model&format=SafeTensor&size=pruned&fp=bf16'
+    dl anima_baseV10.safetensors '2945208?type=Model&format=SafeTensor&size=full&fp=bf16'
+    dl animaCatTower_v10.safetensors '2950472?type=Model&format=SafeTensor&size=pruned&fp=bf16'
     dl waiANIMA_v10.safetensors '2859702?type=Model&format=SafeTensor&size=pruned&fp=fp16'
     echo "[OK] CivitAI models ready"
 else
